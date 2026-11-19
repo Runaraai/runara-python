@@ -81,6 +81,13 @@ A training call is never retried automatically. One that timed out may already
 have applied its gradients, and sending it again would train on the same batch
 twice.
 
+## Checked against the reference
+
+The renderers are verified to produce byte-identical tokens, targets and loss
+masks to `tinker-cookbook` for the same conversation and tokenizer. Chat
+templating is the part of fine-tuning that goes wrong silently, so it is
+checked against an independent implementation rather than only against itself.
+
 ## Installing
 
 The client has no dependencies at all — it is stdlib, so installing it cannot

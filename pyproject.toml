@@ -10,6 +10,8 @@ readme = "README.md"
 dependencies = []
 
 [project.optional-dependencies]
+# The cookbook needs a tokenizer; the client deliberately does not.
+cookbook = ["transformers>=4.45"]
 dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
