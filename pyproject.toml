@@ -1,0 +1,17 @@
+[project]
+name = "runara"
+version = "0.1.0"
+description = "Fine-tune open models on Runara. You write the training loop."
+requires-python = ">=3.10"
+readme = "README.md"
+# No runtime dependencies. The client is stdlib so that installing it cannot
+# conflict with whatever torch, transformers or numpy versions your training
+# code already pins — the cookbook is where the heavy dependencies live.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
