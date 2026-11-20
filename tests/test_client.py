@@ -62,6 +62,8 @@ class Recorder:
             return 200, {"ok": True, "step": self.step}
         if path.endswith("/sample"):
             return 200, {"sequences": [[1, 2, 3]], "token_count": 3}
+        if path.endswith("/load_state"):
+            return 200, {"ok": True, "step": self.step}
         if path.endswith("/save_state"):
             return 200, {"checkpointKey": "finetune/o/s/sampler_weights/1"}
         if path == "/api/v1/finetune/models":
@@ -341,3 +343,27 @@ class TestWorkerIsPinned:
         recorder.worker_base = recorder.worker_base.replace("https://", "http://")
         with pytest.raises(ValueError, match="https"):
             client.create_lora_training_client(base_model="m", rank=8)
+
+
+class TestLoadState:
+    def test_resumes_through_the_same_queue(self, service):
+        # Ordering is the point. Loading while a forward_backward is still in
+        # flight would train one batch against the old weights and the next
+        # against the new, and the curve would look merely noisy.
+        client, recorder = service
+        tc = client.create_lora_training_client(base_model="m", rank=8)
+        tc.forward_backward([Datum(token_ids=[1, 2], target_tokens=[2, 3], weights=[1.0, 1.0])])
+        result = tc.load_state("gs://bucket/finetune/org/sess/sampler_weights/10").result()
+        assert result["ok"] is True
+
+        actions = [p.rsplit("/", 1)[-1] for _, p, _ in recorder.calls if "/sessions/" in p]
+        assert actions.index("forward_backward") < actions.index("load_state")
+
+    def test_sends_the_uri_the_worker_checks(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client(base_model="m", rank=8)
+        uri = "gs://bucket/finetune/org/sess/sampler_weights/10"
+        tc.load_state(uri).result()
+        body = next(b for _, p, b in recorder.calls if p.endswith("/load_state"))
+        # Verbatim: the worker compares it against the org in the signed token.
+        assert body["uri"] == uri

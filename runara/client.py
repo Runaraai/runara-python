@@ -235,6 +235,30 @@ class TrainingClient:
 
         return self._submitter.submit(run)
 
+    def load_state(self, uri: str) -> Future[dict]:
+        """Resume from a checkpoint saved earlier. Blocks on prior work.
+
+        The counterpart of save_state, and what makes a lost worker
+        recoverable: a session is placed on whichever GPU had capacity, so the
+        adapter in VRAM goes when that machine does. The weights in object
+        storage do not.
+
+        `uri` is the storage location from a checkpoint — list_checkpoints()
+        returns it. It must belong to your organization; the worker compares
+        it against the session token the control plane signed, and answers
+        "not found" for anything else rather than confirming it exists.
+
+        Through the same queue as everything else: loading while a
+        forward_backward is still in flight would train one batch against the
+        old weights and the next against the new, and the loss curve would
+        look merely noisy.
+        """
+
+        def run() -> dict:
+            return self._call("load_state", {"uri": uri})
+
+        return self._submitter.submit(run)
+
     # -- session -----------------------------------------------------------
 
     def status(self) -> dict:
