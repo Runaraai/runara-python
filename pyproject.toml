@@ -32,8 +32,14 @@ dev = ["pytest>=8.0"]
 # Both are shipped. The cookbook is a module inside this distribution rather
 # than a separate one, so it installs as runara[cookbook] — "pip install
 # runara-cookbook" names a package that does not and will not exist.
-[tool.setuptools]
-packages = ["runara", "runara_cookbook"]
+# Explicitly every package, subpackages included. An explicit list silently
+# omits what it does not name: "packages = [runara, runara_cookbook]" built a
+# wheel without runara_cookbook.renderers, so "from runara_cookbook import
+# renderers" — the first line of the quickstart — would have failed on a
+# version number that can never be re-uploaded.
+[tool.setuptools.packages.find]
+include = ["runara*", "runara_cookbook*"]
+namespaces = false
 
 [project.urls]
 Homepage = "https://runara.ai"
