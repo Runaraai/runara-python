@@ -14,6 +14,9 @@ Two different endpoints with different failure characters:
 from __future__ import annotations
 
 import json
+import os
+import ssl
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +24,51 @@ from typing import Any
 
 #: Only these are retried on the worker path: the request did not land.
 _CONNECTION_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
+
+
+class _PinnedWorker:
+    """A TLS context that trusts one worker's certificate and nothing else.
+
+    A training worker is rented for minutes at an address we do not own, so
+    there is no public certificate for it and no DNS name to put in one. The
+    control plane, which we do authenticate normally, tells us the exact
+    certificate the worker will present; this trusts that and only that.
+
+    That is stronger than the usual path rather than weaker. A public CA would
+    vouch for anyone who could prove control of the address; this vouches for
+    the one machine the control plane placed our session on. The alternative
+    actually on offer — ``verify=False`` — would leave the training tokens on
+    the wire readable by anyone between here and the GPU.
+    """
+
+    def __init__(self, cert_pem: str):
+        if not cert_pem.startswith("-----BEGIN CERTIFICATE-----"):
+            raise ValueError("worker certificate is not PEM")
+        # NamedTemporaryFile because SSLContext loads CAs from a path. Written
+        # 0600 and removed when the client is done with it.
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".pem", prefix="runara-worker-", delete=False
+        )
+        try:
+            os.chmod(handle.name, 0o600)
+            handle.write(cert_pem)
+        finally:
+            handle.close()
+        self._path = handle.name
+
+        context = ssl.create_default_context(cafile=self._path)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        # The certificate carries the worker's IP in its SAN, so the hostname
+        # check is a real check and stays on.
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        self.context = context
+
+    def close(self) -> None:
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass
 
 
 class RunaraError(Exception):
@@ -60,6 +108,7 @@ def request(
     *,
     timeout: float = 600.0,
     retries: int = 0,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Any:
     """One request, retried only when it provably did not arrive.
 
@@ -81,7 +130,9 @@ def request(
             },
         )
         try:
-            with urllib.request.urlopen(http_request, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                http_request, timeout=timeout, context=ssl_context
+            ) as response:
                 raw = response.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as error:

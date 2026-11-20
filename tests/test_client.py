@@ -9,6 +9,12 @@ the transport is stubbed.
 from __future__ import annotations
 
 import json
+import os
+import pathlib
+import shutil
+import ssl
+import subprocess
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,14 +44,15 @@ class Recorder:
         if path == "/api/v1/finetune/sessions" and method == "POST":
             return 200, {
                 "session_id": "sess_1",
-                "worker_url": self.base,
+                "worker_url": self.worker_base,
+                "worker_cert_pem": self.worker_cert,
                 "session_token": "tok_1",
                 "expires_at": self.token_expiry_ms,
             }
         if path.endswith("/token"):
             return 200, {
                 "session_token": "tok_refreshed",
-                "worker_url": self.base,
+                "worker_url": self.worker_base,
                 "expires_at": int((time.time() + 3600) * 1000),
             }
         if path.endswith("/forward_backward"):
@@ -99,15 +106,49 @@ def service():
         def do_DELETE(self):
             self._run("DELETE")
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    recorder.base = f"http://127.0.0.1:{httpd.server_address[1]}"
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    client = runara.ServiceClient(api_key="rk_test", base_url=recorder.base + "/api/v1")
+    # Two servers, because production has two very different connections.
+    #
+    # The control plane is an ordinary public service. The worker is a box
+    # rented for minutes at an address nobody owns, serving a certificate no
+    # public CA will ever vouch for — so the client is handed that exact
+    # certificate and must trust only it. Serving real TLS here means the
+    # tests exercise that pinning rather than describing it: if the client
+    # ever regressed to skipping verification, or to plain http, these fail.
+    control = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+    threading.Thread(target=control.serve_forever, daemon=True).start()
+
+    certdir = tempfile.mkdtemp(prefix="runara-test-tls-")
+    certfile = os.path.join(certdir, "worker.crt")
+    keyfile = os.path.join(certdir, "worker.key")
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-keyout", keyfile, "-out", certfile,
+            "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True, capture_output=True,
+    )
+
+    worker = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    worker.socket = ssl_context.wrap_socket(worker.socket, server_side=True)
+    threading.Thread(target=worker.serve_forever, daemon=True).start()
+
+    recorder.base = control_base
+    recorder.worker_base = f"https://127.0.0.1:{worker.server_address[1]}"
+    recorder.worker_cert = pathlib.Path(certfile).read_text()
+
+    client = runara.ServiceClient(api_key="rk_test", base_url=control_base + "/api/v1")
     try:
         yield client, recorder
     finally:
-        httpd.shutdown()
-        httpd.server_close()
+        control.shutdown()
+        control.server_close()
+        worker.shutdown()
+        worker.server_close()
+        shutil.rmtree(certdir, ignore_errors=True)
 
 
 def batch() -> list[Datum]:
@@ -249,3 +290,54 @@ def test_lists_the_catalog_with_prices(service):
     models = client.list_models()
     assert models[0].base_model == "qwen3.5-4b"
     assert models[0].train_usd_per_million == 0.74
+
+
+class TestWorkerIsPinned:
+    """The data plane's security rests entirely on this, so prove it.
+
+    The worker holds customer training tokens on a connection to an address
+    we do not own, certified by nobody. What makes that safe is that the
+    control plane names the certificate and the client accepts no other. A
+    regression to skipping verification would leave every test above passing.
+    """
+
+    def test_a_different_certificate_is_refused(self, service):
+        client, recorder = service
+        # A valid certificate, correctly signed, for the right address — just
+        # not the one the control plane named. This is the attack: someone
+        # between the client and the GPU presenting their own certificate.
+        certdir = tempfile.mkdtemp(prefix="runara-impostor-")
+        try:
+            other_cert = os.path.join(certdir, "other.crt")
+            other_key = os.path.join(certdir, "other.key")
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-days", "1", "-keyout", other_key, "-out", other_cert,
+                    "-subj", "/CN=127.0.0.1",
+                    "-addext", "subjectAltName=IP:127.0.0.1",
+                ],
+                check=True, capture_output=True,
+            )
+            recorder.worker_cert = pathlib.Path(other_cert).read_text()
+
+            tc = client.create_lora_training_client(base_model="m", rank=8)
+            with pytest.raises(Exception) as caught:
+                tc.forward_backward(
+                    [Datum(token_ids=[1, 2], target_tokens=[2, 3], weights=[0.0, 1.0])]
+                ).result()
+            # Specifically a TLS failure, not a timeout or a 500 that happened
+            # to look like one.
+            assert "certificate" in str(caught.value).lower() or "ssl" in str(
+                caught.value
+            ).lower()
+        finally:
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def test_a_plaintext_worker_url_is_refused(self, service):
+        client, recorder = service
+        # A downgrade must fail loudly here rather than quietly putting the
+        # customer's tokens on the wire in the clear.
+        recorder.worker_base = recorder.worker_base.replace("https://", "http://")
+        with pytest.raises(ValueError, match="https"):
+            client.create_lora_training_client(base_model="m", rank=8)

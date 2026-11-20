@@ -1,9 +1,24 @@
+# Without this, the package cannot be built as a wheel at all — pip falls
+# back to legacy behaviour and `python -m build` refuses outright.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "runara"
 version = "0.1.0"
 description = "Fine-tune open models on Runara. You write the training loop."
 requires-python = ">=3.10"
 readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Runara" }]
+keywords = ["llm", "fine-tuning", "lora", "training"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 # No runtime dependencies. The client is stdlib so that installing it cannot
 # conflict with whatever torch, transformers or numpy versions your training
 # code already pins — the cookbook is where the heavy dependencies live.
@@ -13,6 +28,16 @@ dependencies = []
 # The cookbook needs a tokenizer; the client deliberately does not.
 cookbook = ["transformers>=4.45"]
 dev = ["pytest>=8.0"]
+
+# Both are shipped. The cookbook is a module inside this distribution rather
+# than a separate one, so it installs as runara[cookbook] — "pip install
+# runara-cookbook" names a package that does not and will not exist.
+[tool.setuptools]
+packages = ["runara", "runara_cookbook"]
+
+[project.urls]
+Homepage = "https://runara.ai"
+Source = "https://github.com/Runaraai/runara-python"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

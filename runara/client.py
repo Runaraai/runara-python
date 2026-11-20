@@ -119,6 +119,11 @@ class ServiceClient:
             worker_url=body["worker_url"].rstrip("/"),
             token=body["session_token"],
             token_expires_at=body["expires_at"],
+            # The worker is rented for minutes at an address nobody owns, so
+            # there is no public certificate for it. The control plane, which
+            # we authenticate normally, tells us exactly which certificate it
+            # will present; we trust that one and refuse anything else.
+            worker_cert_pem=body["worker_cert_pem"],
         )
 
     # -- plumbing ----------------------------------------------------------
@@ -150,11 +155,18 @@ class TrainingClient:
         worker_url: str,
         token: str,
         token_expires_at: int,
+        worker_cert_pem: str,
     ) -> None:
         self.service = service
         self.session_id = session_id
+        if not worker_url.startswith("https://"):
+            # Never negotiable. This connection carries the customer's
+            # training tokens, and a plaintext worker_url would hand them to
+            # anyone on the path while everything still appeared to work.
+            raise ValueError(f"worker_url must be https, got {worker_url!r}")
         self.worker_url = worker_url
         self._token = _SessionToken(token, token_expires_at)
+        self._pinned = _http._PinnedWorker(worker_cert_pem)
         self._submitter = Submitter()
 
     # -- the primitives ----------------------------------------------------
@@ -238,6 +250,8 @@ class TrainingClient:
             self.service._control("DELETE", f"/finetune/sessions/{self.session_id}")
         finally:
             self._submitter.close()
+            # The pinned certificate lives in a temp file; remove it.
+            self._pinned.close()
 
     def __enter__(self) -> "TrainingClient":
         return self
@@ -257,6 +271,7 @@ class TrainingClient:
             token,
             payload,
             retries=0,
+            ssl_context=self._pinned.context,
         )
 
     def _fresh_token(self) -> str:
