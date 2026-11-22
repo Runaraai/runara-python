@@ -38,6 +38,13 @@ DEFAULT_BASE_URL = "https://runara.ai/api/v1"
 #: Refresh this far before expiry, so a long call cannot start on a token that
 #: dies mid-flight.
 TOKEN_REFRESH_MARGIN_SECONDS = 120
+#: Nothing is kept warm, so a new session usually waits for a GPU to be rented
+#: for it. Ask the control plane how that wait is going at this interval.
+SESSION_POLL_INTERVAL_SECONDS = 5.0
+#: Stop waiting for a worker after this long. The control plane fails a session
+#: that never got capacity after fifteen minutes, so this only bounds a control
+#: plane that stops answering.
+SESSION_START_TIMEOUT_SECONDS = 20 * 60
 
 
 class ServiceClient:
@@ -100,6 +107,10 @@ class ServiceClient:
         `request_id` makes this idempotent. One is generated if you do not
         supply it, so a retry after a timeout returns the session you already
         have rather than opening a second one you would also be billed for.
+
+        Nothing is kept warm, so a session usually exists before its worker
+        does. This waits for the worker and returns a client that can talk to
+        it, and raises once the session fails or the wait runs out.
         """
         payload = {
             "request_id": request_id or f"sdk-{uuid.uuid4().hex}",
@@ -113,6 +124,8 @@ class ServiceClient:
             payload["target_modules"] = target_modules
 
         body = self._control("POST", "/finetune/sessions", payload)
+        if body.get("status") == "pending_capacity":
+            body = self._wait_for_worker(body["session_id"])
         return TrainingClient(
             service=self,
             session_id=body["session_id"],
@@ -127,6 +140,36 @@ class ServiceClient:
         )
 
     # -- plumbing ----------------------------------------------------------
+
+    def _wait_for_worker(self, session_id: str) -> dict:
+        """Wait for the session to be placed on a worker, then get a token.
+
+        The create call answers `pending_capacity` when no GPU was warm for it,
+        with no address and no token. Polling the session is what the control
+        plane asks for; a session it cannot place is failed by its watchdog,
+        which this reports instead of waiting on a session that will never run.
+        """
+        deadline = time.monotonic() + SESSION_START_TIMEOUT_SECONDS
+        while True:
+            status = self._control("GET", f"/finetune/sessions/{session_id}")["status"]
+            if status == "pending_capacity":
+                if time.monotonic() >= deadline:
+                    raise _http.RunaraError(
+                        f"No worker was started for session {session_id} within "
+                        f"{SESSION_START_TIMEOUT_SECONDS // 60} minutes."
+                    )
+                time.sleep(SESSION_POLL_INTERVAL_SECONDS)
+                continue
+            if status in ("closed", "closing"):
+                raise _http.SessionClosed(
+                    f"Session {session_id} ended before a worker was ready for it."
+                )
+            if status == "failed":
+                raise _http.RunaraError(
+                    f"Session {session_id} failed before a worker was ready for it."
+                )
+            issued = self._control("POST", f"/finetune/sessions/{session_id}/token")
+            return {"session_id": session_id, **issued}
 
     def _control(self, method: str, path: str, body: dict | None = None):
         # The control plane is retried: these calls are rare, and the one that
