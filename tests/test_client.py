@@ -33,6 +33,12 @@ class Recorder:
         self.token_expiry_ms = int((time.time() + 3600) * 1000)
         self.fail_next: tuple[int, dict] | None = None
         self.step = 0
+        # A create that finds no warm capacity answers with a session and no
+        # worker at all. The client has to wait for one.
+        self.pending_creates = 0
+        self.pending_session_id = "sess_pending"
+        self.pending_session_status = "initializing"
+        self.session_polls = 0
 
     def handle(self, method: str, path: str, body: dict) -> tuple[int, dict]:
         self.calls.append((method, path, body))
@@ -42,6 +48,16 @@ class Recorder:
             return status, payload
 
         if path == "/api/v1/finetune/sessions" and method == "POST":
+            if self.pending_creates > 0:
+                self.pending_creates -= 1
+                return 200, {
+                    "session_id": self.pending_session_id,
+                    "status": "pending_capacity",
+                    "worker_url": None,
+                    "session_token": None,
+                    "expires_at": None,
+                    "message": "A GPU is being started for this session.",
+                }
             return 200, {
                 "session_id": "sess_1",
                 "worker_url": self.worker_base,
@@ -49,10 +65,19 @@ class Recorder:
                 "session_token": "tok_1",
                 "expires_at": self.token_expiry_ms,
             }
+        if method == "GET" and path == f"/api/v1/finetune/sessions/{self.pending_session_id}":
+            self.session_polls += 1
+            status = (
+                "pending_capacity"
+                if self.session_polls < 2
+                else self.pending_session_status
+            )
+            return 200, {"session_id": self.pending_session_id, "status": status}
         if path.endswith("/token"):
             return 200, {
                 "session_token": "tok_refreshed",
                 "worker_url": self.worker_base,
+                "worker_cert_pem": self.worker_cert,
                 "expires_at": int((time.time() + 3600) * 1000),
             }
         if path.endswith("/forward_backward"):
@@ -169,6 +194,46 @@ class TestSessionLifecycle:
         # Generated for the caller: a retry after a timeout must return the
         # session they already have, not open a second billable one.
         assert body["request_id"].startswith("sdk-")
+        # A worker was already attached, so there was nothing to wait for.
+        assert recorder.session_polls == 0
+
+    def test_waits_out_a_cold_start_instead_of_building_on_a_null_address(
+        self, service, monkeypatch
+    ):
+        """Nothing is kept warm, so create often answers before a worker exists."""
+        client, recorder = service
+        recorder.pending_creates = 1
+        monkeypatch.setattr(runara.client, "SESSION_POLL_INTERVAL_SECONDS", 0.01)
+
+        tc = client.create_lora_training_client("qwen3.5-4b", rank=16)
+
+        # The create answer carried no worker_url and no token; the client
+        # waited for a worker and then trained against it.
+        assert tc.session_id == "sess_pending"
+        assert recorder.session_polls >= 1
+        assert tc.worker_url == recorder.worker_base
+        assert tc.forward_backward(batch()).result().loss == 2.5
+        tc.close()
+
+    def test_a_session_that_never_gets_a_gpu_fails_loudly(self, service, monkeypatch):
+        client, recorder = service
+        recorder.pending_creates = 1
+        recorder.pending_session_status = "failed"
+        monkeypatch.setattr(runara.client, "SESSION_POLL_INTERVAL_SECONDS", 0.01)
+
+        with pytest.raises(runara.RunaraError, match="failed before a worker"):
+            client.create_lora_training_client("qwen3.5-4b")
+
+    def test_a_session_closed_while_waiting_raises_session_closed(
+        self, service, monkeypatch
+    ):
+        client, recorder = service
+        recorder.pending_creates = 1
+        recorder.pending_session_status = "closed"
+        monkeypatch.setattr(runara.client, "SESSION_POLL_INTERVAL_SECONDS", 0.01)
+
+        with pytest.raises(SessionClosed, match="ended before a worker"):
+            client.create_lora_training_client("qwen3.5-4b")
 
     def test_an_explicit_request_id_is_used_verbatim(self, service):
         client, recorder = service
