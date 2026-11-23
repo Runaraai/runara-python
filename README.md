@@ -4,28 +4,32 @@ Fine-tune open models without hosting them. You write the training loop; we
 hold the base weights and run the forward and backward passes.
 
 ```bash
-pip install runara runara-cookbook
+pip install "runara[cookbook]"
+export RUNARA_API_KEY=rk_live_...
 ```
 
 ```python
 import runara
-from runara_cookbook import renderers
+from runara_cookbook import data, renderers
+from transformers import AutoTokenizer
 
-sc = runara.ServiceClient(api_key="rk_live_...")
-tc = sc.create_lora_training_client(base_model="qwen3.5-4b", rank=32)
+# Tokenized on your machine; only token ids and a loss mask are sent.
+renderer = renderers.get("generic", AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct"))
+dataset = data.build_data(renderer, data.conversations(data.read_jsonl("my_tickets.jsonl")))
 
-renderer = renderers.get("qwen3_5", tokenizer=tc.get_tokenizer())
-rows = [json.loads(line) for line in open("my_tickets.jsonl")]   # your disk
-
-for epoch in range(3):
-    for chunk in batches(rows, 8):
-        data = [renderer.to_datum(row["messages"]) for row in chunk]
-        fb = tc.forward_backward(data)              # submitted, not awaited
-        tc.optim_step(runara.AdamParams(1e-4))      # submitted straight after
-        print(fb.result().loss)                     # the loop blocks here
-
-tc.save_state(name="support-v1")
+sc = runara.ServiceClient()                      # reads RUNARA_API_KEY
+with sc.create_lora_training_client(base_model="qwen-2.5-7b", rank=32) as tc:  # waits for a GPU
+    for epoch in range(3):
+        for batch in data.batches(dataset, 8, shuffle=True, seed=epoch):
+            fb = tc.forward_backward(batch)              # submitted, not awaited
+            tc.optim_step(runara.AdamParams(1e-4))       # submitted straight after
+            print(fb.result().loss)                      # the loop blocks here
+    tc.save_state(name="support-v1").result()
 ```
+
+`base_model` is a slug from the console's Models tab, and the tokenizer is
+that model's Repository. `my_tickets.jsonl` holds one
+`{"messages": [{"role": ..., "content": ...}, ...]}` per line.
 
 ## Your data does not leave your machine
 

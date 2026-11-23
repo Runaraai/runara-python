@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runara"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fine-tune open models on Runara. You write the training loop."
 requires-python = ">=3.10"
 readme = "README.md"
@@ -26,7 +26,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # The cookbook needs a tokenizer; the client deliberately does not.
-cookbook = ["transformers>=4.45"]
+cookbook = ["transformers>=4.45", "jinja2>=3.1"]
 dev = ["pytest>=8.0"]
 
 # Both are shipped. The cookbook is a module inside this distribution rather

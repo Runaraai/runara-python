@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 from . import _http
 from ._futures import Future, Submitter
+from ._http import RunaraError
 from .types import (
     AdamParams,
     Checkpoint,
@@ -34,10 +35,13 @@ from .types import (
     SampleResult,
 )
 
-DEFAULT_BASE_URL = "https://runara.ai/api/v1"
+# The app, not the marketing site: runara.ai is a Framer page and 404s here.
+DEFAULT_BASE_URL = "https://app.runara.ai/api/v1"
 #: Refresh this far before expiry, so a long call cannot start on a token that
 #: dies mid-flight.
 TOKEN_REFRESH_MARGIN_SECONDS = 120
+#: How often to ask again while a GPU is being started for a new session.
+POLL_SECONDS = 10
 
 
 class ServiceClient:
@@ -94,12 +98,18 @@ class ServiceClient:
         target_modules: list[str] | None = None,
         method: str = "lora",
         request_id: str | None = None,
+        wait_timeout: float = 25 * 60,
     ) -> "TrainingClient":
         """Open a session and get a client for it.
+
+        Blocks until the session has a GPU. Nothing is kept warm, so the first
+        session on a model usually waits a few minutes while one boots;
+        `wait_timeout` (seconds) bounds that wait.
 
         `request_id` makes this idempotent. One is generated if you do not
         supply it, so a retry after a timeout returns the session you already
         have rather than opening a second one you would also be billed for.
+        The wait relies on exactly that: it replays the same request.
         """
         payload = {
             "request_id": request_id or f"sdk-{uuid.uuid4().hex}",
@@ -112,7 +122,27 @@ class ServiceClient:
         if target_modules is not None:
             payload["target_modules"] = target_modules
 
-        body = self._control("POST", "/finetune/sessions", payload)
+        deadline = time.monotonic() + wait_timeout
+        announced = False
+        while True:
+            body = self._control("POST", "/finetune/sessions", payload)
+            if body.get("worker_url"):
+                break
+            if time.monotonic() >= deadline:
+                raise RunaraError(
+                    f"No GPU was ready for session {body.get('session_id')} after "
+                    f"{wait_timeout:.0f}s. Retry with request_id={payload['request_id']!r} "
+                    "to keep waiting for the same session."
+                )
+            if not announced:
+                print(
+                    f"runara: starting a GPU for session {body.get('session_id')}; "
+                    "this usually takes a few minutes...",
+                    flush=True,
+                )
+                announced = True
+            time.sleep(POLL_SECONDS)
+
         return TrainingClient(
             service=self,
             session_id=body["session_id"],
@@ -271,9 +301,11 @@ class TrainingClient:
         until the watchdog reclaims it half an hour later.
         """
         try:
+            # Drain first: a save_state still queued when the session closes
+            # would be refused, and the adapter it was meant to keep is lost.
+            self._submitter.close()
             self.service._control("DELETE", f"/finetune/sessions/{self.session_id}")
         finally:
-            self._submitter.close()
             # The pinned certificate lives in a temp file; remove it.
             self._pinned.close()
 

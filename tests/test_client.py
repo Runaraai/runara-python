@@ -33,6 +33,8 @@ class Recorder:
         self.token_expiry_ms = int((time.time() + 3600) * 1000)
         self.fail_next: tuple[int, dict] | None = None
         self.step = 0
+        #: How many session-create calls answer "GPU still starting" first.
+        self.pending_creates = 0
 
     def handle(self, method: str, path: str, body: dict) -> tuple[int, dict]:
         self.calls.append((method, path, body))
@@ -41,6 +43,14 @@ class Recorder:
             self.fail_next = None
             return status, payload
 
+        if path == "/api/v1/finetune/sessions" and method == "POST" and self.pending_creates:
+            self.pending_creates -= 1
+            # The real server's shape while a worker boots: same session, no worker.
+            return 200, {
+                "session_id": "sess_1", "status": "pending_capacity",
+                "worker_url": None, "session_token": None,
+                "expires_at": None, "worker_cert_pem": None,
+            }
         if path == "/api/v1/finetune/sessions" and method == "POST":
             return 200, {
                 "session_id": "sess_1",
@@ -189,6 +199,40 @@ class TestSessionLifecycle:
         # Otherwise a crashed script leaves a GPU slot held until the watchdog
         # reclaims it half an hour later.
         assert any(method == "DELETE" for method, _, _ in recorder.calls)
+
+    def test_waits_for_a_gpu_that_is_still_starting(self, service, monkeypatch):
+        # Nothing is kept warm, so this is the first response almost every
+        # customer sees. It must be waited out, not crashed on.
+        monkeypatch.setattr(runara.client, "POLL_SECONDS", 0)
+        client, recorder = service
+        recorder.pending_creates = 2
+        tc = client.create_lora_training_client("qwen3.5-4b")
+
+        assert tc.worker_url == recorder.worker_base
+        creates = [body for method, path, body in recorder.calls if path.endswith("/finetune/sessions")]
+        assert len(creates) == 3
+        # Replayed, not reopened: a new request_id would be a second billable session.
+        assert len({body["request_id"] for body in creates}) == 1
+
+    def test_gives_up_waiting_with_the_request_id_to_resume(self, service, monkeypatch):
+        monkeypatch.setattr(runara.client, "POLL_SECONDS", 0)
+        client, recorder = service
+        recorder.pending_creates = 10_000
+        with pytest.raises(runara.RunaraError, match="my-own-id-0002"):
+            client.create_lora_training_client(
+                "qwen3.5-4b", request_id="my-own-id-0002", wait_timeout=0
+            )
+
+    def test_closing_waits_for_a_queued_save(self, service):
+        client, recorder = service
+        with client.create_lora_training_client("qwen3.5-4b") as tc:
+            tc.save_state(name="last")  # deliberately not awaited
+        paths = [path for _, path, _ in recorder.calls]
+        assert any(p.endswith("/save_state") for p in paths)
+        save = next(i for i, p in enumerate(paths) if p.endswith("/save_state"))
+        close = next(i for i, (m, _, _) in enumerate(recorder.calls) if m == "DELETE")
+        # Closing first would refuse the save and lose the adapter.
+        assert save < close
 
 
 class TestPipelining:
@@ -367,3 +411,9 @@ class TestLoadState:
         body = next(b for _, p, b in recorder.calls if p.endswith("/load_state"))
         # Verbatim: the worker compares it against the org in the signed token.
         assert body["uri"] == uri
+
+
+def test_defaults_to_the_app_not_the_marketing_site(monkeypatch):
+    # runara.ai is the Framer site and answers /api/v1 with a 404 page.
+    monkeypatch.delenv("RUNARA_BASE_URL", raising=False)
+    assert runara.ServiceClient(api_key="rk_test").base_url == "https://app.runara.ai/api/v1"
