@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 
@@ -31,8 +32,12 @@ from .types import (
     Checkpoint,
     Datum,
     ForwardBackwardResult,
+    ForwardResult,
+    GpuOption,
     ModelInfo,
+    SampledSequence,
     SampleResult,
+    SamplingParams,
 )
 
 # The app, not the marketing site: runara.ai is a Framer page and 404s here.
@@ -60,11 +65,12 @@ class ServiceClient:
     # -- catalog -----------------------------------------------------------
 
     def list_models(self) -> list[ModelInfo]:
-        """Base models open for training, with their per-token prices.
+        """Base models open for training, with what they cost.
 
-        A fixed catalog rather than any HuggingFace id: the weights have to be
-        already resident on a worker for sessions to share them, which is what
-        makes per-token pricing possible at all.
+        Billed per GPU-hour on the GPU a session lands on (gpu_options,
+        cheapest first) and per GB-month for checkpoints you keep. A fixed
+        catalog rather than any HuggingFace id: the weights have to be
+        resident on a worker before a session can train against them.
         """
         body = self._control("GET", "/finetune/models")
         return [
@@ -74,18 +80,27 @@ class ServiceClient:
                 max_rank=row["max_rank"],
                 max_seq_len=row["max_seq_len"],
                 default_target_modules=row["default_target_modules"],
-                train_usd_per_million=row["train_usd_per_million"],
-                sample_usd_per_million=row["sample_usd_per_million"],
+                train_usd_per_million=row.get("train_usd_per_million", 0.0),
+                sample_usd_per_million=row.get("sample_usd_per_million", 0.0),
+                gpu_options=[
+                    GpuOption(gpu=g["gpu"], gpu_count=g["gpu_count"], usd_per_hour=g["usd_per_hour"])
+                    for g in row.get("gpu_options", [])
+                ],
+                checkpoint_storage_usd_per_gb_month=row.get("checkpoint_storage_usd_per_gb_month", {}),
             )
             for row in body["data"]
         ]
 
     def list_checkpoints(self, base_model: str | None = None) -> list[Checkpoint]:
-        path = "/finetune/checkpoints"
+        """Your saved checkpoints, newest first, each with the `uri` load_state takes."""
+        # include=uri asks for the storage location. Opt-in, because 0.1.x
+        # clients built Checkpoint(**row) and would break on a field they did
+        # not know; this client ignores unknown fields.
+        query = {"include": "uri"}
         if base_model:
-            path += f"?base_model={base_model}"
-        body = self._control("GET", path)
-        return [Checkpoint(**row) for row in body["data"]]
+            query["base_model"] = base_model
+        body = self._control("GET", "/finetune/checkpoints?" + urllib.parse.urlencode(query))
+        return [Checkpoint.from_wire(row) for row in body["data"]]
 
     # -- sessions ----------------------------------------------------------
 
@@ -198,37 +213,98 @@ class TrainingClient:
         self._token = _SessionToken(token, token_expires_at)
         self._pinned = _http._PinnedWorker(worker_cert_pem)
         self._submitter = Submitter()
+        #: The worker's capabilities, fetched on first use of a newer feature.
+        self._capabilities: dict | None = None
+        #: Set when a forward_backward fails, so the optim_step queued behind
+        #: it is refused rather than applying a partial or stale gradient.
+        self._failed_forward_backward: BaseException | None = None
+        #: Metrics from the most recent optim_step, e.g. {"grad_norm": 0.41}.
+        self.last_optim_metrics: dict = {}
 
     # -- the primitives ----------------------------------------------------
 
     def forward_backward(
-        self, data: list[Datum], loss_fn: str = "cross_entropy"
+        self,
+        data: list[Datum],
+        loss_fn: str = "cross_entropy",
+        loss_fn_config: dict | None = None,
     ) -> Future[ForwardBackwardResult]:
-        """Accumulate gradients for one batch. Returns immediately.
+        """Accumulate gradients for one batch under `loss_fn`. Returns immediately.
+
+        Losses: "cross_entropy" (supervised; weights), "importance_sampling",
+        "ppo", "cispo", "dro" (RL; logprobs and advantages) and "dpo"
+        (preference pairs, chosen then rejected, alternating; weights).
+        `loss_fn_config` sets each loss's knobs, e.g. ppo's
+        clip_low_threshold / clip_high_threshold, dro's and dpo's beta, or
+        cross_entropy's reduction ("mean", the default, or "sum").
 
         Submit this and `optim_step` back to back without awaiting: the worker
         applies calls for a session in the order they arrive, so the network
         round trip overlaps your next batch of tokenization instead of
         stalling the GPU.
         """
-        payload = {"data": [datum.to_wire() for datum in data], "loss_fn": loss_fn}
+        if loss_fn != "cross_entropy" or loss_fn_config:
+            self._require(f"loss_fn={loss_fn!r}", lambda caps: loss_fn in caps.get("losses", ()))
+        payload: dict = {"data": [datum.to_wire() for datum in data], "loss_fn": loss_fn}
+        if loss_fn_config:
+            payload["loss_fn_config"] = dict(loss_fn_config)
 
         def run() -> ForwardBackwardResult:
-            body = self._call("forward_backward", payload)
+            try:
+                body = self._call("forward_backward", payload)
+            except BaseException as error:
+                self._failed_forward_backward = error
+                raise
             return ForwardBackwardResult(
                 loss=body["loss"],
                 metrics=body.get("metrics", {}),
                 seq_count=body.get("seq_count", len(data)),
                 token_count=body.get("token_count", 0),
+                logprobs=[o.get("logprobs", []) for o in body.get("loss_fn_outputs", [])],
+            )
+
+        return self._submitter.submit(run)
+
+    def forward(self, data: list[Datum], *, reference: bool = False) -> Future[ForwardResult]:
+        """The logprob of each target token, without training.
+
+        `reference=True` scores against the base model the session started
+        from (the adapter disabled): a free reference policy for KL penalties
+        and DPO, with no second session.
+        """
+        self._require("forward()", lambda caps: caps.get("forward") is True)
+        payload = {"data": [datum.to_wire() for datum in data], "reference": reference}
+
+        def run() -> ForwardResult:
+            body = self._call("forward", payload)
+            return ForwardResult(
+                logprobs=[o["logprobs"] for o in body["loss_fn_outputs"]],
+                seq_count=body.get("seq_count", len(data)),
             )
 
         return self._submitter.submit(run)
 
     def optim_step(self, params: AdamParams) -> Future[int]:
-        """Apply the accumulated gradients. Returns the new step number."""
+        """Apply the accumulated gradients. Returns the new step number.
+
+        Refused, with the reason, if the forward_backward queued before it
+        failed: stepping then would apply a stale or partial gradient. The
+        failure is cleared once reported, so the next batch proceeds.
+        The step's metrics (grad_norm) land in `last_optim_metrics`.
+        """
+        if params.grad_clip_norm:
+            self._require("grad_clip_norm", lambda caps: caps.get("optim", {}).get("grad_clip_norm") is True)
 
         def run() -> int:
-            return self._call("optim_step", {"adam": params.to_wire()})["step"]
+            failed, self._failed_forward_backward = self._failed_forward_backward, None
+            if failed is not None:
+                raise RunaraError(
+                    "optim_step skipped: the forward_backward before it failed "
+                    f"({failed}). No update was applied."
+                )
+            body = self._call("optim_step", {"adam": params.to_wire()})
+            self.last_optim_metrics = body.get("metrics", {})
+            return body["step"]
 
         return self._submitter.submit(run)
 
@@ -237,16 +313,40 @@ class TrainingClient:
         prompts: list[list[int]],
         max_tokens: int = 64,
         temperature: float = 1.0,
+        *,
+        num_samples: int = 1,
+        sampling_params: SamplingParams | None = None,
     ) -> Future[SampleResult]:
-        """Generate from the adapter as it stands, without ending the session."""
+        """Generate from the adapter as it stands, without ending the session.
+
+        `num_samples` continuations of each prompt, each with the learner's
+        logprob of every token and a stop reason: the raw material of an RL
+        step. `sampling_params` adds top_p, top_k, stop and seed; when given,
+        it replaces `max_tokens` and `temperature`.
+        """
+        params = sampling_params or SamplingParams(max_tokens=max_tokens, temperature=temperature)
+        legacy = num_samples == 1 and sampling_params is None
+        if not legacy:
+            self._require("num_samples / sampling_params", lambda caps: "sample" in caps)
+            payload = {"prompts": prompts, "num_samples": num_samples, "sampling_params": params.to_wire()}
+        else:
+            # The shape every worker understands; newer ones answer with
+            # samples, older ones with sequences only.
+            payload = {"prompts": prompts, "max_tokens": max_tokens, "temperature": temperature}
 
         def run() -> SampleResult:
-            body = self._call(
-                "sample",
-                {"prompts": prompts, "max_tokens": max_tokens, "temperature": temperature},
-            )
+            body = self._call("sample", payload)
+            if "samples" in body:
+                samples = [
+                    [SampledSequence(s["tokens"], s.get("logprobs", []), s.get("stop_reason", "unknown")) for s in group]
+                    for group in body["samples"]
+                ]
+            else:
+                samples = [[SampledSequence(tokens, [], "unknown")] for tokens in body["sequences"]]
             return SampleResult(
-                sequences=body["sequences"], token_count=body.get("token_count", 0)
+                sequences=body.get("sequences", [group[0].tokens for group in samples]),
+                token_count=body.get("token_count", 0),
+                samples=samples,
             )
 
         return self._submitter.submit(run)
@@ -316,6 +416,41 @@ class TrainingClient:
         self.close()
 
     # -- plumbing ----------------------------------------------------------
+
+    def capabilities(self) -> dict:
+        """What this session's worker can do. Fetched once, then cached.
+
+        A worker started before RL support answers 404, which reads as the
+        original protocol: supervised training and plain sampling only.
+        """
+        if self._capabilities is None:
+            try:
+                self._capabilities = _http.request(
+                    "GET",
+                    f"{self.worker_url}/v1/capabilities",
+                    self._fresh_token(),
+                    retries=1,
+                    timeout=30.0,
+                    ssl_context=self._pinned.context,
+                )
+            except RunaraError as error:
+                if error.status != 404:
+                    raise
+                self._capabilities = {"protocol": 1, "losses": ["cross_entropy"]}
+        return self._capabilities
+
+    def _require(self, feature: str, supported) -> None:
+        """Refuse a feature this session's worker lacks, before sending anything.
+
+        Otherwise an older worker answers with an opaque 400, or worse, an
+        older one that ignored loss_fn would quietly train cross-entropy.
+        """
+        if not supported(self.capabilities()):
+            raise RunaraError(
+                f"This session's worker does not support {feature}: it started before "
+                "that feature existed. Close this session and start a new one; new "
+                "sessions run on current workers."
+            )
 
     def _call(self, action: str, payload: dict) -> dict:
         token = self._fresh_token()

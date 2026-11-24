@@ -35,6 +35,15 @@ class Recorder:
         self.step = 0
         #: How many session-create calls answer "GPU still starting" first.
         self.pending_creates = 0
+        #: What GET /v1/capabilities answers. None plays a worker started
+        #: before capabilities existed, which answers 404.
+        self.capabilities: dict | None = {
+            "protocol": 2,
+            "losses": ["cross_entropy", "importance_sampling", "ppo", "cispo", "dro", "dpo"],
+            "forward": True,
+            "sample": {"num_samples": 64, "logprobs": True},
+            "optim": {"grad_clip_norm": True},
+        }
 
     def handle(self, method: str, path: str, body: dict) -> tuple[int, dict]:
         self.calls.append((method, path, body))
@@ -65,13 +74,44 @@ class Recorder:
                 "worker_url": self.worker_base,
                 "expires_at": int((time.time() + 3600) * 1000),
             }
+        if path == "/v1/capabilities" and method == "GET":
+            if self.capabilities is None:
+                return 404, {"error": "not_found"}
+            return 200, self.capabilities
         if path.endswith("/forward_backward"):
-            return 200, {"loss": 2.5, "metrics": {"loss": 2.5}, "seq_count": 1, "token_count": 7}
+            return 200, {
+                "loss": 2.5, "metrics": {"loss": 2.5, "loss:sum": 2.5}, "seq_count": 1, "token_count": 7,
+                "loss_fn_outputs": [{"logprobs": [-0.5] * len(d["target_tokens"])} for d in body.get("data", [])],
+            }
+        if path.endswith("/forward"):
+            return 200, {
+                "loss_fn_outputs": [{"logprobs": [-0.25] * len(d["target_tokens"])} for d in body.get("data", [])],
+                "seq_count": len(body.get("data", [])),
+            }
         if path.endswith("/optim_step"):
             self.step += 1
-            return 200, {"ok": True, "step": self.step}
+            return 200, {"ok": True, "step": self.step, "metrics": {"grad_norm": 0.5}}
+        if path.endswith("/sample") and "sampling_params" in body:
+            n = body.get("num_samples", 1)
+            return 200, {
+                "samples": [
+                    [{"tokens": [5, 6], "logprobs": [-0.1, -0.2], "stop_reason": "stop"}] * n
+                    for _ in body["prompts"]
+                ],
+                "sequences": [[5, 6] for _ in body["prompts"]],
+                "token_count": 2 * n * len(body["prompts"]),
+            }
         if path.endswith("/sample"):
             return 200, {"sequences": [[1, 2, 3]], "token_count": 3}
+        if path.startswith("/api/v1/finetune/checkpoints"):
+            return 200, {"data": [{
+                "checkpoint_id": "ck_1", "name": "v1", "kind": "sampler_weights", "step": 3,
+                "base_model": "qwen3.5-4b", "base_model_repository": "Qwen/Qwen3.5-4B",
+                "rank": 32, "size_bytes": 1024, "files": [], "created_at": 1, "expires_at": None,
+                "uri": "s3://bucket/finetune/org/sess/sampler_weights/3",
+                # A field from a newer server this client has never heard of.
+                "storage_usd_per_month": 0.01,
+            }]}
         if path.endswith("/load_state"):
             return 200, {"ok": True, "step": self.step}
         if path.endswith("/save_state"):
@@ -417,3 +457,147 @@ def test_defaults_to_the_app_not_the_marketing_site(monkeypatch):
     # runara.ai is the Framer site and answers /api/v1 with a 404 page.
     monkeypatch.delenv("RUNARA_BASE_URL", raising=False)
     assert runara.ServiceClient(api_key="rk_test").base_url == "https://app.runara.ai/api/v1"
+
+
+def rl_batch() -> list[Datum]:
+    return [Datum(token_ids=[1, 2, 3], target_tokens=[2, 3, 4], logprobs=[0.0, -0.4, -0.6], advantages=[0.0, 1.0, 1.0])]
+
+
+def worker_calls(recorder, action):
+    return [body for method, path, body in recorder.calls if path.endswith(f"/{action}")]
+
+
+class TestLosses:
+    def test_an_rl_loss_and_its_config_reach_the_worker(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        result = tc.forward_backward(rl_batch(), "ppo", {"clip_high_threshold": 1.3}).result()
+        sent = worker_calls(recorder, "forward_backward")[-1]
+        assert sent["loss_fn"] == "ppo"
+        assert sent["loss_fn_config"] == {"clip_high_threshold": 1.3}
+        assert sent["data"][0] == {
+            "token_ids": [1, 2, 3], "target_tokens": [2, 3, 4],
+            "logprobs": [0.0, -0.4, -0.6], "advantages": [0.0, 1.0, 1.0],
+        }
+        assert result.logprobs == [[-0.5, -0.5, -0.5]]
+        assert result.metrics["loss:sum"] == 2.5
+
+    def test_supervised_data_still_sends_exactly_what_0_1_sent(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        tc.forward_backward(batch()).result()
+        sent = worker_calls(recorder, "forward_backward")[-1]
+        assert sent == {"data": [{"token_ids": [1, 2, 3], "target_tokens": [2, 3, 4], "weights": [0.0, 1.0, 1.0]}], "loss_fn": "cross_entropy"}
+
+    def test_an_old_worker_is_refused_an_rl_loss_before_anything_is_sent(self, service):
+        # Old workers ignored loss_fn: sending RL data to one would have
+        # trained it as cross-entropy, silently.
+        client, recorder = service
+        recorder.capabilities = None
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        with pytest.raises(runara.RunaraError, match="start a new one"):
+            tc.forward_backward(rl_batch(), "importance_sampling")
+        assert worker_calls(recorder, "forward_backward") == []
+
+    def test_an_old_worker_still_trains_supervised(self, service):
+        client, recorder = service
+        recorder.capabilities = None
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        assert tc.forward_backward(batch()).result().loss == 2.5
+
+
+class TestForward:
+    def test_returns_logprobs_and_can_ask_for_the_reference(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        result = tc.forward(batch(), reference=True).result()
+        assert result.logprobs == [[-0.25, -0.25, -0.25]]
+        assert worker_calls(recorder, "forward")[-1]["reference"] is True
+
+    def test_refused_on_an_old_worker(self, service):
+        client, recorder = service
+        recorder.capabilities = None
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        with pytest.raises(runara.RunaraError, match="forward"):
+            tc.forward(batch())
+
+
+class TestSamplingV2:
+    def test_num_samples_and_params_come_back_with_logprobs(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        params = runara.SamplingParams(max_tokens=8, temperature=0.8, top_p=0.95, stop=["\n"], seed=1)
+        result = tc.sample([[1, 2], [3]], num_samples=3, sampling_params=params).result()
+        sent = worker_calls(recorder, "sample")[-1]
+        assert sent == {
+            "prompts": [[1, 2], [3]], "num_samples": 3,
+            "sampling_params": {"max_tokens": 8, "temperature": 0.8, "top_p": 0.95, "top_k": -1, "stop": ["\n"], "seed": 1},
+        }
+        assert [len(group) for group in result.samples] == [3, 3]
+        first = result.samples[0][0]
+        assert (first.tokens, first.logprobs, first.stop_reason) == ([5, 6], [-0.1, -0.2], "stop")
+
+    def test_a_0_1_style_call_sends_the_old_shape_and_still_fills_samples(self, service):
+        client, recorder = service
+        recorder.capabilities = None  # works against any worker
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        result = tc.sample([[1]], max_tokens=3, temperature=0.0).result()
+        assert worker_calls(recorder, "sample")[-1] == {"prompts": [[1]], "max_tokens": 3, "temperature": 0.0}
+        assert result.sequences == [[1, 2, 3]]
+        assert result.samples[0][0].stop_reason == "unknown"
+
+    def test_multiple_samples_are_refused_on_an_old_worker(self, service):
+        client, recorder = service
+        recorder.capabilities = None
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        with pytest.raises(runara.RunaraError):
+            tc.sample([[1]], num_samples=4)
+
+
+class TestAFailedStepIsNotApplied:
+    def test_the_optim_step_behind_a_failed_forward_backward_is_refused(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        recorder.fail_next = (500, {"error": "engine_error"})
+        fb = tc.forward_backward(batch())
+        step = tc.optim_step(AdamParams(1e-4))
+        with pytest.raises(runara.RunaraError):
+            fb.result()
+        with pytest.raises(runara.RunaraError, match="optim_step skipped"):
+            step.result()
+        assert worker_calls(recorder, "optim_step") == []
+
+        # Reported once, then cleared: the next batch trains normally.
+        tc.forward_backward(batch())
+        assert tc.optim_step(AdamParams(1e-4)).result() == 1
+
+    def test_optim_metrics_are_kept_and_clipping_is_sent(self, service):
+        client, recorder = service
+        tc = client.create_lora_training_client("qwen3.5-4b")
+        tc.forward_backward(batch())
+        tc.optim_step(AdamParams(1e-4, grad_clip_norm=1.0)).result()
+        assert worker_calls(recorder, "optim_step")[-1]["adam"]["grad_clip_norm"] == 1.0
+        assert tc.last_optim_metrics == {"grad_norm": 0.5}
+
+
+class TestCatalogAndCheckpoints:
+    def test_models_read_with_or_without_the_retired_token_prices(self, service):
+        client, recorder = service
+        model = client.list_models()[0]
+        assert model.train_usd_per_million == 0.74 and model.gpu_options == []
+
+    def test_checkpoints_carry_a_uri_and_tolerate_fields_this_client_does_not_know(self, service):
+        client, recorder = service
+        checkpoints = client.list_checkpoints(base_model="qwen 3.5")
+        assert checkpoints[0].uri == "s3://bucket/finetune/org/sess/sampler_weights/3"
+        path = [p for m, p, _ in recorder.calls if "checkpoints" in p][-1]
+        assert "include=uri" in path and "base_model=qwen+3.5" in path
+
+
+class TestDatumForRL:
+    def test_rl_inputs_must_line_up_with_the_targets(self):
+        with pytest.raises(ValueError, match="advantages"):
+            Datum(token_ids=[1, 2], target_tokens=[2, 3], logprobs=[0.0, -1.0], advantages=[1.0])
+
+    def test_trained_tokens_counts_advantaged_positions(self):
+        assert rl_batch()[0].trained_tokens == 2

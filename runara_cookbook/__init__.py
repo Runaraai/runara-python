@@ -7,5 +7,5 @@ like before they are sent, so it should be code you can read.
 from . import data, renderers
 from .renderers import TrainOnWhat
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 __all__ = ["data", "renderers", "TrainOnWhat"]
