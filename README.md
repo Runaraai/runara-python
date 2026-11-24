@@ -61,12 +61,77 @@ to back and collect later — the worker applies calls for a session in the
 order they arrive, so the round trip overlaps your next batch of tokenization
 instead of stalling the GPU.
 
+## Reinforcement learning
+
+Sample a group of replies per prompt, score them however you like, and train
+on how much better or worse each did than its group's average:
+
+```python
+from runara_cookbook.rl import rl_data
+
+prompt = renderer.generation_prompt([{"role": "user", "content": question}])
+group = tc.sample([prompt], num_samples=8,
+                  sampling_params=runara.SamplingParams(max_tokens=256)).result().samples[0]
+rewards = [my_reward(renderer.decode(s.tokens)) for s in group]   # your code, your machine
+
+data = rl_data(prompt, group, rewards)        # advantages = reward - group mean
+if data:
+    tc.forward_backward(data, "importance_sampling")
+    tc.optim_step(runara.AdamParams(learning_rate=4e-5))
+```
+
+Each sampled sequence carries the policy's logprob of every token. These are
+scored exactly as training scores them, so on-policy the importance ratio is
+1. `python -m runara_cookbook.recipes.rl_math` is the whole loop, on problems
+with checkable numeric answers.
+
+## Preferences (DPO)
+
+```python
+from runara_cookbook.preference import build_pair
+
+data = build_pair(renderer, prompt_messages, chosen="...", rejected="...")   # chosen first
+out = tc.forward_backward(data, "dpo", {"beta": 0.1}).result()
+print(out.metrics["accuracy"], out.metrics["margin"])
+```
+
+The reference policy is the base model your session started from, at no
+extra cost. To compare against something else, send `ref_logprobs` on each
+datum. The whole loop is in `python -m runara_cookbook.recipes.dpo`.
+
+## Losses
+
+| `loss_fn` | Data | `loss_fn_config` |
+|---|---|---|
+| `cross_entropy` | `weights` | `reduction`: `"mean"` (default) or `"sum"` |
+| `importance_sampling` | `logprobs`, `advantages` | none |
+| `ppo` | `logprobs`, `advantages` | `clip_low_threshold` 0.8, `clip_high_threshold` 1.2 |
+| `cispo` | `logprobs`, `advantages` | `clip_low_threshold` 0.0, `clip_high_threshold` 4.0 |
+| `dro` | `logprobs`, `advantages` | `beta` (required) |
+| `dpo` | `weights`, chosen/rejected alternating, optional `ref_logprobs` | `beta` 0.1 |
+
+The formulas are Tinker's, so its recipes and hyperparameters carry over. The
+one difference: `cross_entropy` defaults to a per-example mean, so a long
+masked prompt doesn't dilute the loss. Pass `{"reduction": "sum"}` for
+Tinker's sum. The RL losses and `dpo` sum over tokens, as Tinker's do.
+
+`tc.forward(data)` returns each target token's logprob without training, and
+`tc.forward(data, reference=True)` returns it under the base model.
+`AdamParams(grad_clip_norm=1.0)` clips gradients, and each step's gradient norm
+is in `tc.last_optim_metrics`.
+
+A session on a worker started before these features existed refuses them up
+front, naming the feature. Start a new session to get a current worker.
+
 ## What you get out
 
 ```python
 for checkpoint in sc.list_checkpoints():
     print(checkpoint.name, checkpoint.size_bytes, checkpoint.base_model)
 ```
+
+Each checkpoint's `uri` is what `tc.load_state(uri)` takes to resume from it.
+Optimizer state isn't saved yet, so a resumed run restarts Adam's moments.
 
 Checkpoints are standard PEFT adapters — `adapter_config.json` and
 `adapter_model.safetensors` — so they load in vLLM, SGLang or transformers
@@ -96,4 +161,4 @@ checked against an independent implementation rather than only against itself.
 
 The client has no dependencies at all — it is stdlib, so installing it cannot
 conflict with whatever `torch`, `transformers` or `numpy` versions your
-training code already pins. The heavy dependencies live in `runara-cookbook`.
+training code already pins. The cookbook's dependencies (`transformers` for tokenizers) come with the `runara[cookbook]` extra.

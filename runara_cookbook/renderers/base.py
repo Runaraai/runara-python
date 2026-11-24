@@ -82,6 +82,8 @@ class Tokenizer(Protocol):
 
     def encode(self, text: str, add_special_tokens: bool = ...) -> list[int]: ...
 
+    def decode(self, tokens: Sequence[int], **kwargs) -> str: ...
+
     def apply_chat_template(
         self, conversation: Sequence[Message], tokenize: bool = ..., **kwargs
     ) -> str: ...
@@ -134,6 +136,25 @@ class Renderer:
     ) -> Datum:
         """Render and shift in one call. What you send to `forward_backward`."""
         return to_datum(self.build_supervised_example(messages, train_on_what))
+
+    def generation_prompt(self, messages: Sequence[Message]) -> list[int]:
+        """The tokens to sample a reply to `messages` from: what `sample()` takes.
+
+        Tokenized exactly as the prompt part of a training example is, so an
+        RL datum built from this prompt plus a sampled reply lines up with
+        what supervised training on the same conversation would have seen.
+        """
+        if not messages:
+            raise ValueError("no messages to render")
+        return self.tokenizer.encode(self.render_prefix(messages), add_special_tokens=False)
+
+    def decode(self, tokens: Sequence[int]) -> str:
+        """A sampled reply as text, without special tokens such as end-of-turn."""
+        try:
+            return self.tokenizer.decode(list(tokens), skip_special_tokens=True)
+        except TypeError:
+            # A minimal tokenizer that takes no keyword arguments.
+            return self.tokenizer.decode(list(tokens))
 
     # -- masking -----------------------------------------------------------
 
