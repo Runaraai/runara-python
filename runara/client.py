@@ -382,6 +382,10 @@ class TrainingClient:
         forward_backward is still in flight would train one batch against the
         old weights and the next against the new, and the loss curve would
         look merely noisy.
+
+        Checkpoints hold weights only, as Tinker's do: training after a
+        load_state starts with a fresh optimizer, never with the momentum of
+        whatever this session trained before. (Workers before 0.7.2 kept it.)
         """
 
         def run() -> dict:
